@@ -96,6 +96,7 @@ _snapshot_executor: Optional["BoundedThreadPoolExecutor"] = None
 _request_manager: Optional[RequestManager] = None
 _event_broker: Optional[EventBroker] = None
 _stream_hub: Optional[StreamHub] = None
+_stream_end_handler: Optional[Any] = None
 _auth_context: ContextVar[Optional["AuthContext"]] = ContextVar(
     "auth_context", default=None
 )
@@ -213,14 +214,7 @@ def initialize_workload_manager() -> None:
 
 
 def event_broker() -> EventBroker:
-    """Return the initialized live-streaming event broker.
-
-    Raises:
-        RuntimeError: If streaming is not enabled on this server.
-
-    Returns:
-        The event broker.
-    """
+    """Return the initialized event broker; raises if streaming is off."""
     global _event_broker
     if _event_broker is None:
         raise RuntimeError(
@@ -231,14 +225,7 @@ def event_broker() -> EventBroker:
 
 
 def stream_hub() -> StreamHub:
-    """Return the initialized per-replica stream fan-out hub.
-
-    Raises:
-        RuntimeError: If streaming is not enabled on this server.
-
-    Returns:
-        The stream hub.
-    """
+    """Return the initialized stream hub; raises if streaming is off."""
     global _stream_hub
     if _stream_hub is None:
         raise RuntimeError(
@@ -248,14 +235,19 @@ def stream_hub() -> StreamHub:
     return _stream_hub
 
 
-def initialize_streaming() -> None:
+async def initialize_streaming() -> None:
     """Initialize the live event streaming components.
 
-    No-op when `event_broker_implementation_source` is not set. Failures
-    to load the broker class are logged but do not prevent the server
-    from starting — endpoints will simply return 501 Not Implemented.
+    Configured-but-broken streaming fails startup (raises) rather than
+    silently disabling — an opt-in feature should be loud about misuse.
+
+    Raises:
+        RuntimeError: If the configured broker class can't be loaded
+            or its connectivity probe fails.
     """
-    global _event_broker, _stream_hub
+    import asyncio
+
+    global _event_broker, _stream_hub, _stream_end_handler
 
     cfg = server_config()
     source = cfg.event_broker_implementation_source
@@ -268,21 +260,36 @@ def initialize_streaming() -> None:
         broker_class: Type[EventBroker] = source_utils.load_and_validate_class(
             source=source, expected_class=EventBroker
         )
-    except (ModuleNotFoundError, KeyError):
-        logger.warning(
-            "Unable to load event broker from %r; streaming disabled.", source
-        )
-        return
+    except Exception as exc:
+        raise RuntimeError(
+            f"Could not load event broker class {source!r}: {exc}. "
+            "Check `event_broker_implementation_source` on the server "
+            "config."
+        ) from exc
 
     try:
         _event_broker = broker_class()
-    except Exception:
-        logger.exception(
-            "Failed to instantiate event broker %r; streaming disabled.",
-            source,
-        )
+    except Exception as exc:
         _event_broker = None
-        return
+        raise RuntimeError(
+            f"Could not instantiate event broker {source!r}: {exc}"
+        ) from exc
+
+    # Connectivity probe — a non-existent key is a cheap round-trip
+    # that exercises the broker's connection without producing data.
+    # Failing here is far better than 503ing every request later.
+    try:
+        await _event_broker.latest_id("zenml:stream:startup-probe")
+    except Exception as exc:
+        broker = _event_broker
+        _event_broker = None
+        try:
+            await broker.close()
+        except Exception:
+            logger.debug("Probe-failure broker close errored", exc_info=True)
+        raise RuntimeError(
+            f"Event broker {source!r} startup probe failed: {exc}"
+        ) from exc
 
     _stream_hub = StreamHub(
         broker=_event_broker,
@@ -290,10 +297,29 @@ def initialize_streaming() -> None:
         idle_grace_seconds=cfg.streaming_hub_idle_grace_seconds,
     )
 
+    from zenml.dispatcher import EventDispatcher
+    from zenml.zen_server.streaming.signals import StreamEndEventHandler
+
+    _stream_end_handler = StreamEndEventHandler(
+        broker=_event_broker, loop=asyncio.get_running_loop()
+    )
+    EventDispatcher().register_event_handler(_stream_end_handler)
+
 
 async def shutdown_streaming() -> None:
-    """Cancel hub readers and close the broker. Safe to call when off."""
-    global _event_broker, _stream_hub
+    """Cancel hub readers, unregister handlers, and close the broker.
+
+    Safe to call when streaming is off.
+    """
+    global _event_broker, _stream_hub, _stream_end_handler
+    if _stream_end_handler is not None:
+        from zenml.dispatcher import EventDispatcher
+
+        try:
+            EventDispatcher().unregister_event_handler(_stream_end_handler)
+        except Exception:
+            logger.exception("Error unregistering stream-end handler")
+        _stream_end_handler = None
     if _stream_hub is not None:
         try:
             await _stream_hub.shutdown()

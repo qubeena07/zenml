@@ -15,4 +15,4 @@
 
 from zenml.streams.api import flush, publish
 
-__all__ = ["flush", "publish",]
+__all__ = ["flush", "publish"]

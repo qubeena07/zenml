@@ -26,6 +26,24 @@ spec:
     - {{ $server.gateway.host | quote }}
   {{- end }}
   rules:
+    # Long-lived SSE streaming endpoints. Scoped to the run-events tree
+    # so other endpoints can't accidentally disable their timeouts by
+    # sending an `Accept: text/event-stream` header. Envoy applies a 15s
+    # wall-clock request timeout by default which kills SSE responses;
+    # setting timeouts to 0s disables that cap.
+    - matches:
+        - path:
+            type: PathPrefix
+            value: {{ printf "%s/api/v1/runs/" (trimSuffix "/" ($server.gateway.path | default "/")) | quote }}
+          headers:
+            - name: Accept
+              value: text/event-stream
+      timeouts:
+        request: "0s"
+        backendRequest: "0s"
+      backendRefs:
+        - name: {{ $fullName }}
+          port: {{ $svcPort }}
     - matches:
         - path:
             type: PathPrefix

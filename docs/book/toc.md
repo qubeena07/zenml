@@ -45,6 +45,7 @@
   * [Wait for External Input](how-to/steps-pipelines/wait_resume.md)
   * [Advanced Features](how-to/steps-pipelines/advanced_features.md)
   * [Dynamic Pipelines](how-to/steps-pipelines/dynamic_pipelines.md)
+  * [Streaming Events](how-to/steps-pipelines/streaming_events.md)
 * [Artifacts](how-to/artifacts/artifacts.md)
   * [Materializers](how-to/artifacts/materializers.md)
   * [Visualizations](how-to/artifacts/visualizations.md)

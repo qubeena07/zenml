@@ -28,26 +28,21 @@ from zenml.models import (
     StepRunResponse,
     StepRunUpdate,
 )
+from zenml.streams.publisher import flush_and_drain
 from zenml.utils.time_utils import utc_now
 
 logger = get_logger(__name__)
 
+_STREAM_FLUSH_TIMEOUT_SECONDS = 2.0
 
-def _drain_step_streams() -> None:
-    """Best-effort drain of any pending stream events before step end.
 
-    Imported lazily so the streaming optional dep stack stays decoupled
-    from the orchestrator hot path.
-    """
-    try:
-        from zenml.streams.publisher import flush_and_drain
-
-        flush_and_drain(timeout=2.0)
-    except Exception:
-        # Streaming is best-effort. Never let it fail a step.
-        logger.debug(
-            "Stream flush skipped (publisher not initialized or failed)",
-            exc_info=True,
+def _flush_streams_at_step_end() -> None:
+    """Drain pending stream events; warn (don't raise) on timeout."""
+    if not flush_and_drain(timeout=_STREAM_FLUSH_TIMEOUT_SECONDS):
+        logger.warning(
+            "Stream publisher did not drain within %.1fs at step end; "
+            "some events may not have reached the server.",
+            _STREAM_FLUSH_TIMEOUT_SECONDS,
         )
 
 
@@ -73,7 +68,7 @@ def publish_successful_step_run(
     Returns:
         The updated step run.
     """
-    _drain_step_streams()
+    _flush_streams_at_step_end()
     return Client().zen_store.update_run_step(
         step_run_id=step_run_id,
         step_run_update=StepRunUpdate(
@@ -113,7 +108,7 @@ def publish_step_run_status_update(
         end_time = utc_now()
 
     if status.is_finished:
-        _drain_step_streams()
+        _flush_streams_at_step_end()
 
     step_run = Client().zen_store.update_run_step(
         step_run_id=step_run_id,

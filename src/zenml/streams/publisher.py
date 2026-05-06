@@ -14,10 +14,10 @@
 """Background batched publisher for stream events."""
 
 import atexit
-import queue
 import threading
 import time
-from typing import Dict, List, Optional
+from collections import defaultdict, deque
+from typing import Deque, Dict, List, Optional
 from uuid import UUID
 
 from zenml.logger import get_logger
@@ -26,31 +26,37 @@ from zenml.models import EventBatchRequest, StreamEvent
 logger = get_logger(__name__)
 
 _QUEUE_MAXSIZE = 4096
-_FLUSH_INTERVAL_SECONDS = 0.05
 _FLUSH_BATCH_SIZE = 64
-_FLUSH_BATCH_BYTES = 64 * 1024
+# After the server returns 501 we mute the publisher for this long
+# before probing again. Long-lived processes (notebooks, REPLs) recover
+# once an operator turns streaming on — at the cost of one failed batch
+# per window.
+_DISABLED_RECHECK_SECONDS = 5 * 60.0
+# Worker wait granularity when the buffer is empty. Short enough that
+# `shutdown()` and `flush()` aren't perceived as laggy.
+_WORKER_IDLE_WAIT_SECONDS = 0.5
 
 _publisher_lock = threading.Lock()
 _publisher: Optional["_StreamPublisher"] = None
 
 
 class _StreamPublisher:
-    """Thread-safe singleton publisher.
-
-    Producers push `StreamEvent`s onto an internal queue; one daemon
-    thread drains the queue, groups by pipeline_run_id, and POSTs.
-    """
+    """Thread-safe batched publisher; one daemon thread drains the buffer."""
 
     def __init__(self) -> None:
-        self._queue: "queue.Queue[Optional[StreamEvent]]" = queue.Queue(
-            maxsize=_QUEUE_MAXSIZE
-        )
+        self._buf: Deque[StreamEvent] = deque()
+        self._cond = threading.Condition()
+        self._inflight = 0
         self._stop = threading.Event()
-        self._dropped = 0
-        self._coalesced = 0
-        self._disabled_on_server = False
+        # Monotonic deadline at which a server-disabled producer may
+        # retry. `None` means "not disabled". Read/written under
+        # `_cond`.
+        self._disabled_until: Optional[float] = None
         self._thread: Optional[threading.Thread] = None
         self._start_lock = threading.Lock()
+        # Counters surfaced at shutdown for operator visibility.
+        self._dropped_queue_full = 0
+        self._dropped_no_store = 0
 
     def _ensure_thread(self) -> None:
         with self._start_lock:
@@ -63,36 +69,54 @@ class _StreamPublisher:
                 self._thread.start()
                 atexit.register(self._atexit)
 
+    def _is_disabled(self) -> bool:
+        """Check (and lazily clear) the server-disabled deadline."""
+        with self._cond:
+            return self._check_disabled_locked()
+
+    def _check_disabled_locked(self) -> bool:
+        deadline = self._disabled_until
+        if deadline is None:
+            return False
+        if time.monotonic() >= deadline:
+            self._disabled_until = None
+            return False
+        return True
+
     def publish(self, event: StreamEvent) -> None:
         """Enqueue an event for delivery. Never blocks user code."""
-        if self._disabled_on_server:
-            return
-        self._ensure_thread()
-        try:
-            self._queue.put_nowait(event)
-        except queue.Full:
-            # Backpressure: drop oldest, count it as dropped+coalesced. We
-            # don't aggregate payloads here (truly merging two arbitrary
-            # events is unsafe); we just keep the queue moving.
-            try:
-                self._queue.get_nowait()
-                self._dropped += 1
-            except queue.Empty:
-                pass
-            try:
-                self._queue.put_nowait(event)
-            except queue.Full:
-                self._dropped += 1
-
-    def flush(self, timeout: Optional[float] = None) -> None:
-        """Block until the queue is drained or timeout elapses."""
         if self._thread is None:
-            return
-        deadline = (time.time() + timeout) if timeout is not None else None
-        while not self._queue.empty():
-            if deadline is not None and time.time() > deadline:
+            self._ensure_thread()
+        with self._cond:
+            if self._check_disabled_locked():
                 return
-            time.sleep(0.01)
+            if len(self._buf) >= _QUEUE_MAXSIZE:
+                # Why: dropping oldest keeps the publisher responsive;
+                # merging arbitrary payloads is unsafe.
+                self._buf.popleft()
+                self._dropped_queue_full += 1
+            self._buf.append(event)
+            self._cond.notify()
+
+    def flush(self, timeout: Optional[float] = None) -> bool:
+        """Wait for the buffer + in-flight batches to drain.
+
+        Returns:
+            True if drained before the deadline, False on timeout.
+        """
+        if self._thread is None:
+            return True
+        deadline = (time.time() + timeout) if timeout is not None else None
+        with self._cond:
+            while self._buf or self._inflight > 0:
+                if deadline is None:
+                    self._cond.wait(timeout=_WORKER_IDLE_WAIT_SECONDS)
+                    continue
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    return False
+                self._cond.wait(timeout=remaining)
+            return True
 
     def shutdown(self, timeout: float = 2.0) -> None:
         """Stop the daemon thread; final flush attempt."""
@@ -100,13 +124,18 @@ class _StreamPublisher:
             return
         self.flush(timeout=timeout)
         self._stop.set()
-        # Wake the worker if it's blocked on get():
-        try:
-            self._queue.put_nowait(None)
-        except queue.Full:
-            pass
+        # Wake the worker if it's waiting on an empty buffer.
+        with self._cond:
+            self._cond.notify_all()
         self._thread.join(timeout=timeout)
         self._thread = None
+        if self._dropped_queue_full or self._dropped_no_store:
+            logger.warning(
+                "Stream publisher dropped events on shutdown: "
+                "%d due to queue overflow, %d due to no ZenML client.",
+                self._dropped_queue_full,
+                self._dropped_no_store,
+            )
 
     def _atexit(self) -> None:
         try:
@@ -116,6 +145,11 @@ class _StreamPublisher:
 
     def _run(self) -> None:
         while not self._stop.is_set():
+            if self._is_disabled():
+                self._drain_discard()
+                if self._stop.wait(timeout=_WORKER_IDLE_WAIT_SECONDS):
+                    return
+                continue
             try:
                 batch = self._collect_batch()
             except Exception:
@@ -126,74 +160,84 @@ class _StreamPublisher:
                 continue
             self._send_batch(batch)
 
+    def _drain_discard(self) -> None:
+        with self._cond:
+            self._buf.clear()
+            self._cond.notify_all()
+
     def _collect_batch(self) -> List[StreamEvent]:
-        events: List[StreamEvent] = []
-        approx_bytes = 0
-        deadline = time.time() + _FLUSH_INTERVAL_SECONDS
+        """Atomically drain a batch and reserve an in-flight slot.
 
-        try:
-            first = self._queue.get(timeout=_FLUSH_INTERVAL_SECONDS)
-        except queue.Empty:
-            return []
-        if first is None:
-            return []
-        events.append(first)
-        approx_bytes += len(first.kind) + 256
+        Holding `_cond` across drain + `_inflight += 1` is what
+        prevents `flush()` from observing an empty buffer with zero
+        inflight while a batch is mid-flight.
+        """
+        with self._cond:
+            while not self._buf and not self._stop.is_set():
+                self._cond.wait(timeout=_WORKER_IDLE_WAIT_SECONDS)
+            if not self._buf:
+                return []
+            batch: List[StreamEvent] = []
+            while self._buf and len(batch) < _FLUSH_BATCH_SIZE:
+                batch.append(self._buf.popleft())
+            self._inflight += 1
+            return batch
 
-        while (
-            len(events) < _FLUSH_BATCH_SIZE
-            and approx_bytes < _FLUSH_BATCH_BYTES
-            and time.time() < deadline
-        ):
-            try:
-                event = self._queue.get_nowait()
-            except queue.Empty:
-                break
-            if event is None:
-                break
-            events.append(event)
-            approx_bytes += len(event.kind) + 256
-        return events
+    def _release_inflight(self) -> None:
+        with self._cond:
+            self._inflight -= 1
+            if self._inflight == 0 and not self._buf:
+                self._cond.notify_all()
+
+    def _mark_disabled(self) -> None:
+        """Mute publishes for a TTL window after a 501 from the server."""
+        with self._cond:
+            if self._disabled_until is None:
+                logger.warning(
+                    "Streaming disabled on server; publish() will be a "
+                    "no-op for ~%.0fs.",
+                    _DISABLED_RECHECK_SECONDS,
+                )
+            self._disabled_until = time.monotonic() + _DISABLED_RECHECK_SECONDS
 
     def _send_batch(self, events: List[StreamEvent]) -> None:
-        # Group by pipeline_run_id (defensive: a single process should
-        # only service one run at a time, but multiple steps in a
-        # dynamic pipeline could share one process).
-        by_run: Dict[UUID, List[StreamEvent]] = {}
-        for ev in events:
-            by_run.setdefault(ev.pipeline_run_id, []).append(ev)
+        try:
+            self._send_batch_inner(events)
+        finally:
+            self._release_inflight()
 
+    def _send_batch_inner(self, events: List[StreamEvent]) -> None:
         from zenml.client import Client
 
         try:
             zen_store = Client().zen_store
         except Exception:
+            self._dropped_no_store += len(events)
             logger.exception(
-                "Cannot resolve ZenML client; dropping %d events", len(events)
+                "Dropping %d stream events: ZenML client unavailable.",
+                len(events),
             )
             return
 
-        for run_id, group in by_run.items():
+        # Group by run id so a single URL/run mismatch can't fail the
+        # whole batch on the server.
+        grouped: Dict[UUID, List[StreamEvent]] = defaultdict(list)
+        for event in events:
+            grouped[event.pipeline_run_id].append(event)
+
+        for run_id, run_events in grouped.items():
             try:
                 zen_store.publish_run_events(
                     pipeline_run_id=run_id,
-                    batch=EventBatchRequest(events=group),
+                    batch=EventBatchRequest(events=run_events),
                 )
+            except NotImplementedError:
+                self._mark_disabled()
+                return
             except Exception as exc:
-                # Detect "server has streaming disabled" once and stop
-                # trying.
-                msg = str(exc)
-                if "501" in msg or "Not Implemented" in msg:
-                    if not self._disabled_on_server:
-                        logger.warning(
-                            "Streaming disabled on server; further "
-                            "publish() calls will be a no-op."
-                        )
-                    self._disabled_on_server = True
-                    return
                 logger.warning(
                     "Failed to publish %d events for run %s: %s",
-                    len(group),
+                    len(run_events),
                     run_id,
                     exc,
                 )
@@ -202,16 +246,22 @@ class _StreamPublisher:
 def get_publisher() -> _StreamPublisher:
     """Return the per-process publisher singleton, lazily initialized."""
     global _publisher
+    if _publisher is not None:
+        return _publisher
     with _publisher_lock:
         if _publisher is None:
             _publisher = _StreamPublisher()
         return _publisher
 
 
-def flush_and_drain(timeout: float = 2.0) -> None:
-    """Drain pending events. Called by step finalizers."""
-    global _publisher
-    with _publisher_lock:
-        publisher = _publisher
-    if publisher is not None:
-        publisher.flush(timeout=timeout)
+def flush_and_drain(timeout: float = 2.0) -> bool:
+    """Drain pending events. Called by step finalizers.
+
+    Returns:
+        True if the queue was drained before the deadline (or the
+        publisher was never started); False on timeout.
+    """
+    publisher = _publisher
+    if publisher is None:
+        return True
+    return publisher.flush(timeout=timeout)

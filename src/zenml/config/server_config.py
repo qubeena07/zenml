@@ -299,9 +299,9 @@ class ServerConfiguration(BaseModel):
     workload_manager_implementation_source: Optional[str] = None
     resource_pool_implementation_source: Optional[str] = None
     event_broker_implementation_source: Optional[str] = None
-    streaming_heartbeat_seconds: int = 15
-    streaming_max_consumers_per_stream: int = 100
-    streaming_hub_idle_grace_seconds: int = 30
+    streaming_heartbeat_seconds: float = Field(default=30.0, gt=0.0)
+    streaming_max_consumers_per_stream: int = Field(default=100, gt=0)
+    streaming_hub_idle_grace_seconds: float = Field(default=30.0, gt=0.0)
     max_concurrent_snapshot_runs: int = (
         DEFAULT_ZENML_SERVER_MAX_CONCURRENT_SNAPSHOT_RUNS
     )
